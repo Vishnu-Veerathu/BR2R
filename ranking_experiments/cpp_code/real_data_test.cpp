@@ -1,0 +1,774 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <cmath>
+#include <chrono> 
+extern "C"
+{
+    #include "./OptSpace_C/svdlib.h"
+    #include "./OptSpace_C/OptSpace.h"
+}
+#include <fstream>
+#include "graph.h"
+#include <bits/stdc++.h>
+using namespace std;
+using namespace std::chrono;
+
+// File used for evaluation of real datasets.
+
+class Random{
+public:
+    Random(int seed): gen(seed) {};
+    double sample(double min=0.0, double max=1.0){
+        uniform_real_distribution<> dis(min,max);
+        return dis(gen);
+
+    }
+    int sample_int(int min, int max){
+        uniform_int_distribution<> dis(min,max);
+        return dis(gen);
+    }
+    mt19937 gen;
+
+};
+
+// Utility functions are all copied from mrtest_perf.cpp read comments there for better explanation.
+vector < Random> random_samplers;
+
+double calc_frob_norm(vector < vector < double > > &P1, vector <vector <double > > &P2){
+    int n = P1.size();
+    double norm = 0;
+    for(int i = 0;i < n;i++){
+        for(int j = 0; j<n;j++){
+            norm += (P1[i][j]-P2[i][j])*(P1[i][j]-P2[i][j]);
+        }
+    }
+    return norm;
+}
+
+//--------------------------------------------------------------------------------------------
+
+bool beats(vector < vector < double > > &P, int arm1, int arm2){
+    return P[arm1][arm2] > P[arm2][arm1];
+}
+
+//--------------------------------------------------------------------------------------------
+
+// beats function when arms is a permutation of the arms and P follows the permutation order as well. 
+bool perm_beats(vector < vector < double > > &P, vector <int> &arms, int idx1, int idx2){
+    int arm1 = arms[idx1];
+    int arm2 = arms[idx2];
+    return beats(P,arm1,arm2);
+}
+//-------------------------------------------------------------------------------------------
+
+// Find upsets for ranking w.r.t. P
+int upsets(vector<int> &ranking, vector<vector<double>> &P)
+{
+    int upsets = 0;
+    int n = ranking.size();
+    for (int i = 0; i < n; i++)
+    {
+        for (int j = 0; j < i; j++)
+        {
+            if (P[ranking[i]][ranking[j]] > P[ranking[j]][ranking[i]])
+            {
+                upsets++;
+            }
+        }
+    }
+    return upsets;
+}
+//--------------------------------------------------------------------------------------------
+
+// Min Upsets from u, v and P, upsets wrt P_true
+int min_upsets(vector <double> u, vector <double> v, vector <vector <double> > P, vector <vector <double> > P_true){
+    set <pair < double, int> > s;
+    int n = u.size();
+    for(int i = 0;i < u.size();i++){
+        s.insert({atan2(v[i],u[i]),i});
+    }
+
+    vector <int> ranking;
+    for(auto e: s){
+        ranking.push_back(e.second);
+    }
+
+    int mini = n*n;
+    vector<int> best_ranking;
+
+    for(int i = 0;i < n;i++){
+        int ranking_eval = upsets(ranking,P);
+        if(ranking_eval < mini){
+            mini = ranking_eval;
+            best_ranking = ranking;
+        }
+        ranking.push_back(ranking[0]);
+        ranking.erase(ranking.begin()); 
+    }
+    return upsets(best_ranking,P_true);
+}
+
+//-------------------------------------------------------------------------------------------
+
+vector<int> calc_borda_ranking(vector <int> &arms, vector<vector<double > > &P){
+    set < pair <double,int> > s;
+    int n = arms.size();
+    for(int i = 0;i < n;i++){
+        int score = 0;
+        for(int j = 0;j < n;j++){
+            score += P[arms[i]][arms[j]] - P[arms[j]][arms[i]];
+        }
+        s.insert({-score,arms[i]});
+    }
+
+    vector <int> ranking;
+    for(auto itr: s){
+        ranking.push_back(itr.second);
+    }
+    return ranking;
+}
+
+//-------------------------------------------------------------------------------------------
+
+int calc_borda_upsets(vector < vector < double > > &P, vector < vector < double> > &P_true){
+    int n = P.size();
+    vector <int> arms;
+    for(int i = 0;i < n;i++){
+        arms.push_back(i);
+    }
+    vector <int> best_ranking = calc_borda_ranking(arms,P);
+    return upsets(best_ranking,P_true);
+}
+
+//-------------------------------------------------------------------------------------------
+
+// Finds copeland ranking.
+vector<int> calc_copeland_ranking(vector <int> &arms,vector < vector < double > > &P){
+    set < pair <int,int> > s;
+    int n = arms.size();
+    // cout << "Creating Set" << endl;
+    for(int i = 0;i < n;i++){
+        int beats = 0;
+        for(int j = 0;j < n;j++){
+            if(perm_beats(P,arms,i,j)){
+                beats++;
+            }
+        }
+        // cout << beats << " " << arms[i] << endl;
+        s.insert({-beats,arms[i]});
+    }
+
+    vector <int> ranking;
+    for(auto itr: s){
+        ranking.push_back(itr.second);
+    }
+
+    return ranking;
+}
+
+//-------------------------------------------------------------------------------------------
+
+// Find number of copeland upsets for ranking generated by P w.r.t. P_true.
+int calc_copeland_upsets(vector < vector < double > > &P,vector < vector <double > > &P_true){
+    int n = P.size();
+    vector <int> arms;
+    for(int i = 0;i < n;i++){
+        arms.push_back(i);
+    }
+    vector <int> best_ranking = calc_copeland_ranking(arms,P);
+    return upsets(best_ranking,P_true);
+}
+
+//-------------------------------------------------------------------------------------------
+
+// Finds ranking assuming Rank 2 model. Makes additional recursive calls/considerations since all inputs may not by of Rank 2.
+vector<int> optimal_estimated_ranking(vector <int> arms, vector < vector < double > > P, bool use_copeland = false){
+    // vector <double> s;
+    int n = arms.size();
+
+    if(n <= 1){
+        vector <int> best_ranking = arms;
+        return best_ranking;
+    }
+
+    // Find a cycle
+    int a;
+    int b;
+    int c;
+    bool cycle = false;
+
+    for(a = 0;a < n;a++){
+        for(b = 0;b < n;b++){
+            for(c=0;c<n;c++){
+                if(a == b or b== c or c == a){
+                    continue;
+                }
+                if(perm_beats(P,arms,a,b) && perm_beats(P,arms,b,c) && perm_beats(P,arms,c,a)){
+                    cycle = true;
+                    goto skip;
+                }
+            }
+        }
+    }
+    skip:
+
+    if (!cycle || n <= 3){
+        // cout << "Default to Copeland" << endl;
+        return calc_copeland_ranking(arms, P);
+    }
+    
+    vector <int> s_a,s_b,s_c,s_lead,s_behind;
+    for(int i = 0;i < n;i++){
+        int arm = arms[i];
+        bool beats_a = perm_beats(P,arms,i,a);
+        bool beats_b = perm_beats(P,arms,i,b);
+        bool beats_c = perm_beats(P,arms,i,c);
+
+        if(beats_a && beats_b && beats_c){
+            s_lead.push_back(arm);
+        }
+        else if(!beats_a && !beats_b && !beats_c){
+            s_behind.push_back(arm);
+        }
+        else if(beats_a && !beats_b){
+            s_c.push_back(arm);
+        }
+        else if(beats_b && !beats_c){
+            s_a.push_back(arm);
+        }
+        else if(beats_c && !beats_a){
+            s_b.push_back(arm);
+        }   
+    }
+
+    vector<int> ss_a = optimal_estimated_ranking(s_a,P);
+    vector<int> ss_b = optimal_estimated_ranking(s_b,P);
+    vector<int> ss_c = optimal_estimated_ranking(s_c,P);
+    vector<int> ss_lead = optimal_estimated_ranking(s_lead,P);
+    vector<int> ss_behind = optimal_estimated_ranking(s_behind,P);
+
+    vector <int> ranking;
+    for(int i = 0;i < ss_a.size();i++){
+        ranking.push_back(ss_a[i]);
+    }
+    for(int i = 0;i < ss_b.size();i++){
+        ranking.push_back(ss_b[i]);
+    }
+    for(int i = 0;i < ss_c.size();i++){
+        ranking.push_back(ss_c[i]);
+    }
+
+    int mini = n*n;
+    vector<int> best_ranking;
+    int rsize = ranking.size();
+    for(int i = 0;i < rsize;i++){
+        int ranking_eval = upsets(ranking,P);
+        if(ranking_eval < mini){
+            mini = ranking_eval;
+            best_ranking = ranking;
+        }
+        ranking.push_back(ranking[0]);
+        ranking.erase(ranking.begin()); 
+    }
+
+    vector <int> full_best_ranking;
+    for(int i = 0;i < ss_lead.size();i++){
+        full_best_ranking.push_back(ss_lead[i]);
+    }
+    for(int i = 0;i < rsize;i++){
+        full_best_ranking.push_back(best_ranking[i]);
+    }
+    for(int i = 0;i < ss_behind.size();i++){
+        full_best_ranking.push_back(ss_behind[i]);
+    }
+
+    int final_upsets = upsets(full_best_ranking, P);
+    vector <int> copeland_ranking = calc_copeland_ranking(arms, P);
+    int copleand_upsets = upsets(copeland_ranking, P);
+    if(use_copeland && copleand_upsets < final_upsets){
+        // cout << "Copeland Better for size = " << arms.size() << endl;
+        return copeland_ranking;
+    }
+
+    return full_best_ranking;
+}
+
+//-------------------------------------------------------------------------------------------
+
+// Number of upsets of P when ranked according to optimal Rank 2 method w.r.t. P_true.
+int optimal_estimated_upsets(vector < vector < double > > &P,vector < vector <double > > &P_true){
+    int n = P.size();
+    vector <int> arms;
+    for(int i = 0;i < n;i++){
+        arms.push_back(i);
+    }
+    vector <int> best_ranking = optimal_estimated_ranking(arms,P);
+    return upsets(best_ranking,P_true);
+}
+
+//-------------------------------------------------------------------------------------------
+
+vector < vector < double > > ptr_to_vec(double **ptr, int n){
+    vector < vector < double > > ret;
+    for(int i = 0;i < n ;i++){
+        vector <double> temp;
+        for(int j = 0;j < n;j++){
+            temp.push_back(ptr[i][j]);
+        }
+        ret.push_back(temp);
+    }
+    return ret;
+}
+
+//-------------------------------------------------------------------------------------------
+
+double** vec_to_ptr(vector < vector < double > > v, int n){
+    double** ptr = (double**)calloc(n,sizeof(double*));
+    for(int i = 0;i < n;i++){
+        ptr[i] = (double*)calloc(n,sizeof(double));
+        for(int j = 0;j < n;j++){
+            ptr[i][j] = v[i][j];
+        }
+    }
+    return ptr;
+}
+
+//-------------------------------------------------------------------------------------------
+
+void print_vec(vector<vector<double>> v){
+    for(auto e: v){
+        for(auto e1: e){
+            cout << e1 << " ";
+        }
+        cout << endl;
+    }
+}
+
+//-------------------------------------------------------------------------------------------
+
+void swap_index(vector<vector<double > > &m, int idx1, int idx2){
+    int n = m.size();
+    for(int i = 0;i < n;i++){
+        double temp = m[i][idx1];
+        m[i][idx1] = m[i][idx2];
+        m[i][idx2] = temp;
+    }
+    for(int i = 0;i < n;i++){
+        double temp = m[idx1][i];
+        m[idx1][i] = m[idx2][i];
+        m[idx2][i] = temp;
+    }
+}
+
+void swap_index(vector<double> m, int idx1, int idx2){
+    double temp = m[idx1];
+    m[idx1] = m[idx2];
+    m[idx2] = temp;
+}
+
+//-------------------------------------------------------------------------------------------
+
+// For random shuffling of preference matrix.
+void random_shuffle(vector<double> &u, vector <double> &v, vector <double> &s, vector<vector<double > > &m, int seed){
+    int n = m.size();
+    for(int i = 0;i < n-1;i++){
+        int j = random_samplers[seed].sample_int(i,n-1);
+        swap_index(m,i,j);
+        swap_index(u,i,j);
+        swap_index(v,i,j);
+        swap_index(s,i,j);
+    }
+}
+
+//-------------------------------------------------------------------------------------------
+
+double bernoulli_sim(double seed,double p, int k){
+    double sum = 0;
+    if(k > 10001){
+        return p;
+    }
+    for(int i = 0;i < k;i++){
+        if(random_samplers[seed].sample() < p){
+            sum += 1;
+        }
+    }
+    // For prevention of divide by zero errors
+    if(sum == 0){
+        return 0.0001;
+    }
+    if(sum == k){
+        return 1-0.0001;
+    }
+    return sum/k;
+}
+
+//-------------------------------------------------------------------------------------------
+
+vector < vector <double > > complete_matrix(vector < vector <double> > P, int optspace_rank, int num_vals){
+
+	int n = P.size();
+    // Create sparse matrix representation
+    smat s;
+    s.rows = n;
+    s.cols = n;
+    s.vals = num_vals;    
+    s.pointr = (long *)calloc(n + 1, sizeof(long));
+    s.rowind = (long *)calloc(s.vals, sizeof(long));
+    s.value = (double *)calloc(s.vals, sizeof(double));
+    s.pointr[0] = 0;
+
+    int count = 0;
+    for (int j = 0; j < n; j++)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            // cout << i << " " << j << " " << P_est[i][j] << " " << P_est[j][i] << endl;
+            if (P[i][j] > 0 && P[j][i] > 0)
+            {
+                s.rowind[count] = i;
+                s.value[count] = log(P[i][j]/P[j][i]);
+                ++count;
+            }
+            else if((P[i][j] > 0 && P[j][i] == 0) || (P[i][j] == 0 && P[j][i] > 0)){
+                s.rowind[count] = i;
+                s.value[count] = log((1+P[i][j])/(1+P[j][i]));
+                ++count;                
+            }
+        }
+        s.pointr[j + 1] = count;
+    }
+
+
+    // Use Opt_space
+    SMat sptr = &s;
+
+    auto result = OptSpace(sptr, optspace_rank, 100, 0.001, 0, "iterinfo");
+    int n1 = n;
+    int n2 = optspace_rank;
+    int n3 = n;
+
+    // For result calculation
+    double **res1 = (double **)calloc(n1, sizeof(double *));
+    for (int i = 0; i < n1; i++)
+    {
+        res1[i] = (double *)calloc(n2, sizeof(double));
+    }
+    double **res2 = (double **)calloc(n1, sizeof(double *));
+    for (int i = 0; i < n3; i++)
+    {
+        res2[i] = (double *)calloc(n3, sizeof(double));
+    }
+
+    // For reconstructed Matrix
+    matrixmul(result->X, result->S, n1, n2, n2, res1, 0, 1, 0);
+    matrixmul(res1, result->Y, n1, n2, n3, res2, 1, 1, 0);
+    auto P_ret = ptr_to_vec(res2, n);
+    return P_ret;
+}
+
+
+int main()
+{
+    int runs = 20;
+    for (int i = 0; i < runs; i++)
+    {
+        Random r(i);
+        random_samplers.push_back(r);
+    }
+
+    double known_fraction = 0.5;
+    double validation_fraction = 0.2;
+    double test_fraction = 0.3;
+
+    // The data is assumed to be in the following format.
+    // 1) A single line containing number of arms. -> n
+    // 2) A single line containing number of comparisons. -> m
+    // 3) m lines containing data of the form a b c d, where a,b,c, and d are integers.
+    //    a b c d represents the comparisons between arms a and b, where a wins c games and b wins d games.
+
+    int n,m;
+    cin >> n;
+    cin >> m;
+
+    vector <int> p1,p2,p3,p4;
+
+
+    for(int i = 0;i < m;i++){
+        int a,b,c,d;
+        cin >> a >> b >> c >> d;
+        p1.push_back(a);
+        p2.push_back(b);
+        p3.push_back(c);
+        p4.push_back(d);
+    }
+
+    int sum1 = 0,sum2 = 0, sum3 = 0, sum4 = 0;
+
+    vector < vector < vector <int > > > results(runs, vector < vector <int> >(5, vector <int> (4,0)));
+    vector <int> optspace_ranks = {2,4,6,8};
+    for(int run = 0;run < runs ;run++){
+        // split as P_estimated, P_test and P_validation
+        vector < vector < double > > P_est(n ,vector <double > (n,0));
+        vector < vector < double > > P_test(n ,vector <double > (n,0));
+        vector < vector < double > > P_valid(n , vector <double> (n,0));
+        vector < vector < double > > P_est_valid(n , vector <double> (n,0));
+        for(int i = 0;i < n;i++){
+            P_est[i][i] = 0.5;
+            P_est_valid[i][i] = 0.5;
+        }
+        for(int i = 0;i < m;i++){
+            double random_val = random_samplers[run].sample();
+            if (random_val > known_fraction + validation_fraction){
+                P_test[p1[i]][p2[i]] += p3[i];
+                P_test[p2[i]][p1[i]] += p4[i];
+            }
+            else if (random_val > known_fraction ) {
+                P_valid[p1[i]][p2[i]] += p3[i];
+                P_valid[p2[i]][p1[i]] += p4[i];
+                P_est_valid[p1[i]][p2[i]] += p3[i];
+                P_est_valid[p2[i]][p1[i]] += p4[i];
+            }
+            else {
+                P_est[p1[i]][p2[i]] += p3[i];
+                P_est[p2[i]][p1[i]] += p4[i];
+                P_est_valid[p1[i]][p2[i]] += p3[i];
+                P_est_valid[p2[i]][p1[i]] += p4[i];
+            }
+        }
+
+        // If populated entries are too low, we are forced to consider scorelines of the form x:0 or 0:x. Add 1 to each player's score in these case i.e, make it x+1:1 or 1:x+1
+        int count1 = 0;
+        int count2 = 0;
+
+        for(int i = 0;i < n;i++){
+            for(int j = 0;j <= i;j++){
+                double sum = P_est[i][j] + P_est[j][i];
+                if(sum > 0){
+                    P_est[i][j] /= sum;
+                    P_est[j][i] /= sum;
+                }
+                if(P_est[i][j] > 0 && P_est[j][i] > 0){
+                    count1 += 1;
+                    if(i!=j){
+                        count1 += 1;
+                    }
+                }
+                if(P_est[i][j] || P_est[j][i] > 0){
+                    count2 += 1;
+                    if(i!=j){
+                        count2 += 1;
+                    }
+                }
+            }
+        }
+
+        int count3 = 0;
+        int count4 = 0;
+        for(int i = 0;i < n;i++){
+            for(int j = 0;j <= i;j++){
+                double sum = P_est_valid[i][j] + P_est_valid[j][i];
+                if(sum > 0){
+                    P_est_valid[i][j] /= sum;
+                    P_est_valid[j][i] /= sum;
+                }
+                if(P_est_valid[i][j] > 0 && P_est_valid[j][i] > 0){
+                    count3 += 1;
+                    if(i!=j){
+                        count3 += 1;
+                    }
+                }
+                if(P_est_valid[i][j] || P_est_valid[j][i] > 0){
+                    count4 += 1;
+                    if(i!=j){
+                        count4 += 1;
+                    }
+                }
+            }
+        }
+
+        // cout << "P_EST_VALID" << endl;
+        // for(auto e: P_est_valid){
+        //     for(auto e1: e){
+        //         cout << e1 << " ";
+        //     }
+        //     cout << endl;
+        // }
+
+        // Use different ranks for reconstruction and use the ranking which gives least upsets on validation for evaluation with testing data.
+
+        int best_copeland_valid = n*n;
+        int best_borda_valid = n*n;
+        int best_br2_valid = n*n;
+        int best_br2c_valid = n*n;
+
+        int best_copeland_rank;
+        int best_borda_rank;
+        int best_br2_rank;
+        int best_br2c_rank;
+
+        int copeland_test;
+        int borda_test;
+        int br2_test;
+        int br2c_test;
+
+        for(int z = 0; z < optspace_ranks.size();z++){
+            int optspace_rank = optspace_ranks[z];
+            // cout << "RUNNING WITH RANK " << optspace_rank << endl;
+
+            vector< vector <double> > P;
+
+            if(count4 < n*n){
+                P = complete_matrix(P_est_valid, optspace_rank, count4);
+            } else {
+                P = P_est_valid;
+            }
+
+            vector <int> arms;
+            for(int i = 0; i < n;i++){
+                arms.push_back(i);
+            }
+
+            vector <int> copeland_ranking = calc_copeland_ranking(arms,P);
+            results[run][z][0] = upsets(copeland_ranking,P_test);
+            // cout << results[run][z][0] << " ";
+            // if(c_upsets < best_copeland_valid){
+            //     best_copeland_valid = c_upsets;
+            //     // cout << upsets(copeland_ranking, P_test) << endl;
+            //     best_copeland_rank = optspace_rank;
+            // }
+
+            // vector <int> arms;
+            arms.clear();
+            for(int i = 0; i < n;i++){
+                arms.push_back(i);
+            }
+
+            vector <int> borda_ranking = calc_borda_ranking(arms,P);
+            results[run][z][1] += upsets(borda_ranking,P_test);
+            // cout << results[run][z][1] << " ";
+            // if(b_upsets < best_borda_valid){
+            //     best_borda_valid = b_upsets;
+            //     best_borda_rank = optspace_rank;
+            // }
+
+            // vector <int> arms;
+            arms.clear();
+            for(int i = 0; i < n;i++){
+                arms.push_back(i);
+            }
+
+            vector <int> br2_ranking = optimal_estimated_ranking(arms,P);
+            results[run][z][2] = upsets(br2_ranking,P_test);
+            // cout << results[run][z][2] << " ";
+            // if(br2_valid < best_br2_valid){
+            //     best_br2_valid = br2_valid;
+            //     best_br2_rank = optspace_rank;
+            // }
+
+            // vector <int> arms;
+            arms.clear();
+            for(int i = 0; i < n;i++){
+                arms.push_back(i);
+            }
+
+            vector <int> br2c_ranking = optimal_estimated_ranking(arms,P,true);
+            results[run][z][3] = upsets(br2c_ranking,P_test);
+            // cout << results[run][z][3] << endl;
+            // if(br2c_valid < best_br2c_valid){
+            //     best_br2c_valid = br2c_valid;
+            //     best_br2c_rank = optspace_rank;
+            // }
+        }
+    }
+
+    for(int i = 0;i < optspace_ranks.size();i++){
+        cout << "Rank = " << optspace_ranks[i] << endl;
+        for(int j = 0;j < 4;j++){
+            double sum = 0;
+            for(int k = 0; k < runs;k++){
+                // cout << results[k][i][j] << endl;
+                sum += results[k][i][j];
+            }
+            double mean = sum/runs;
+            double dev = 0;
+            for(int k = 0;k<runs;k++){
+                dev += pow((results[k][i][j]-mean),2);
+            }
+            double std = sqrt(dev/runs);
+            cout << mean << "+-" << std << " ";
+        }
+        cout << endl;
+    }
+     //    vector <int> arms;
+	    // for(int i = 0; i < n;i++){
+	    //     arms.push_back(i);
+	    // }
+     //    // cout << "TESTING CP " << best_copeland_rank << endl;
+     //    // auto P = complete_matrix(P_est_valid, best_copeland_rank, count4);
+     //    vector< vector <double> > P;
+     //    if(count4 < n*n){
+     //        P = complete_matrix(P_est_valid, best_copeland_rank, count4);
+     //    } else {
+     //        P = P_est_valid;
+     //    }
+     //    // cout << "Count4 = " << count4 << endl;
+     //    // for(auto e1: P){
+     //    //     for(auto e: e1){
+     //    //         cout << e << " ";
+     //    //     }
+     //    //     cout << endl;
+     //    // }
+     //   	auto copeland_ranking = calc_copeland_ranking(arms, P);
+     //   	copeland_test = upsets(copeland_ranking,P_test);
+
+     //   	arms.clear();
+	    // for(int i = 0; i < n;i++){
+	    //     arms.push_back(i);
+	    // }
+     //   	// cout << "TESTING BORDA" << endl;
+     //    // P = complete_matrix(P_est_valid, best_borda_rank, count4);
+     //    if(count4 < n*n){
+     //        P = complete_matrix(P_est_valid, best_borda_rank, count4);
+     //    } else {
+     //        P = P_est_valid;
+     //    }
+     //   	auto borda_ranking = calc_borda_ranking(arms, P);
+     //   	borda_test = upsets(borda_ranking,P_test);       	
+
+     //   	arms.clear();
+	    // for(int i = 0; i < n;i++){
+	    //     arms.push_back(i);
+	    // }
+     //   	// cout << "TESTING BR2" << endl;
+     //    if(count4 < n*n){
+     //        P = complete_matrix(P_est_valid, best_copeland_rank, count4);
+     //    } else {
+     //        P = P_est_valid;
+     //    }
+     //   	auto br2_ranking = optimal_estimated_ranking(arms, P);
+     //   	br2_test = upsets(br2_ranking, P_test);
+
+     //    arms.clear();
+     //    for(int i = 0; i < n;i++){
+     //        arms.push_back(i);
+     //    }
+     //    // cout << "TESTING BR2" << endl;
+     //    if(count4 < n*n){
+     //        P = complete_matrix(P_est_valid, best_br2c_rank, count4);
+     //    } else {
+     //        P = P_est_valid;
+     //    }
+     //    auto br2c_ranking = optimal_estimated_ranking(arms, P, true);
+     //    br2c_test = upsets(br2c_ranking, P_test);
+
+     //    sum1 += copeland_test;
+     //    sum2 += borda_test;
+     //    sum3 += br2_test;
+     //    sum4 += br2c_test;
+        // cout << run << " " << double(sum1)/(run+1) << " " << double(sum2)/(run+1) << " " << double(sum3)/(run+1) << " " << double(sum4)/(run+1) << endl;
+
+    // Output the sum of upsets across all the runs. Divide by 'runs' for average.
+    // cout << sum1 << " " << sum2 << " " << sum3 << " " << sum4 << endl;
+}
